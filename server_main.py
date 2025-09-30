@@ -56,10 +56,10 @@ def main(cfg: DictConfig) -> None:
             batch_size=cfg.batch_size,
             seq_length=seq_len,
             # restrict_hours=restrict_hours,
-        )
+        )'''
 
     # 3) 评测函数：若跳过评测则使用哑评测
-    gl_test_torch = _dummy_test_fn() if skip_eval else models.test_torch()'''
+    gl_test_torch = _dummy_test_fn()
 
     # 4) 启动联邦服务端
     fl_server = FLServer(
