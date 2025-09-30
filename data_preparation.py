@@ -10,6 +10,127 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
+# ====== HTTP 下载 & 解压 & 目录管理（无第三方依赖） ======
+import urllib.request, shutil, hashlib, zipfile, tarfile
+from pathlib import Path
+
+# 统一的数据根目录（优先环境变量；兼容容器/本地）
+DATASET_DIR = Path(os.environ.get("DATASET_DIR", "./dataset")).resolve()
+
+# 可选：HTTP 下载地址（例如一个 zip）
+DATASET_URL = os.environ.get("DATASET_URL", "")  # 例：https://example.com/fitbit_export.zip
+DATASET_MD5 = os.environ.get("DATASET_MD5", "")  # 可选：MD5 校验
+# 解压后用于读取 CSV 的二级目录（可根据你的压缩包结构调整）
+# 默认自动匹配：archive/mturkfitbit_export_*/Fitabase Data */
+FITBIT_EXPORT_GLOB = os.environ.get("FITBIT_EXPORT_GLOB", "archive/mturkfitbit_export_*")
+FITBIT_SUBDIR_GLOB = os.environ.get("FITBIT_SUBDIR_GLOB", "Fitabase Data */")
+
+def _md5(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _download_with_progress(url: str, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    def _report(blocknum, blocksize, totalsize):
+        readsofar = blocknum * blocksize
+        if totalsize > 0:
+            percent = readsofar * 1.0 / totalsize * 100
+            print(f"\rDownloading {url}  {percent:5.1f}% ({readsofar/1e6:.1f}MB/{totalsize/1e6:.1f}MB)", end="")
+        else:
+            print(f"\rDownloading {url}  {readsofar/1e6:.1f}MB", end="")
+    tmp = dst.with_suffix(dst.suffix + ".part")
+    try:
+        urllib.request.urlretrieve(url, tmp.as_posix(), _report)
+        print()
+        tmp.replace(dst)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
+
+def _extract_archive(archive_path: Path, to_dir: Path):
+    to_dir.mkdir(parents=True, exist_ok=True)
+    ap = archive_path.as_posix()
+    if zipfile.is_zipfile(ap):
+        with zipfile.ZipFile(ap, "r") as zf:
+            zf.extractall(to_dir)
+    elif ap.endswith(".tar.gz") or ap.endswith(".tgz"):
+        with tarfile.open(ap, "r:gz") as tf:
+            tf.extractall(to_dir)
+    elif ap.endswith(".tar"):
+        with tarfile.open(ap, "r:") as tf:
+            tf.extractall(to_dir)
+    else:
+        raise ValueError(f"Unsupported archive format: {archive_path}")
+
+def _auto_locate_fitbit_base(root: Path) -> Path:
+    """
+    自动匹配：archive/mturkfitbit_export_*/Fitabase Data */
+    返回实际的 CSV 根目录（即包含 sleepDay_merged.csv 等文件的目录）
+    """
+    export_dirs = sorted((root / "archive").glob(Path(FITBIT_EXPORT_GLOB).name))
+    if not export_dirs:
+        raise FileNotFoundError(f"没有找到 export 目录：{root}/archive/{FITBIT_EXPORT_GLOB}")
+    # 取最新的一个
+    export_dir = export_dirs[-1]
+    fitabase_dirs = list(export_dir.glob(FITBIT_SUBDIR_GLOB))
+    if not fitabase_dirs:
+        raise FileNotFoundError(f"没有找到 Fitabase 子目录：{export_dir}/{FITBIT_SUBDIR_GLOB}")
+    return fitabase_dirs[0].resolve()
+
+def _ensure_fitbit_data() -> Path:
+    """
+    确保 DATASET_DIR 下已经存在可读取的 Fitbit CSV 目录。
+    - 若不存在且提供了 DATASET_URL：下载压缩包到 DATASET_DIR/archive_downloads 并解压到 DATASET_DIR
+    - 返回可用的 FITBIT_BASE_DIR（包含 *_merged.csv 的目录）
+    """
+    DATASET_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 如果已经有匹配的目录，直接返回
+    try:
+        base = _auto_locate_fitbit_base(DATASET_DIR)
+        print(f"[DATA] Using existing Fitbit base: {base}")
+        return base
+    except FileNotFoundError:
+        pass
+
+    if not DATASET_URL:
+        raise FileNotFoundError(
+            f"数据未就绪：在 {DATASET_DIR} 下未找到 'archive/mturkfitbit_export_*'；"
+            f"且未设置 DATASET_URL 以供自动下载。"
+        )
+
+    # 下载
+    downloads = DATASET_DIR / "archive_downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    fname = DATASET_URL.split("?")[0].rstrip("/").split("/")[-1] or "dataset.zip"
+    archive_path = downloads / fname
+
+    if not archive_path.exists():
+        print(f"[DATA] Downloading dataset from: {DATASET_URL}")
+        _download_with_progress(DATASET_URL, archive_path)
+    else:
+        print(f"[DATA] Found existing archive: {archive_path}")
+
+    # 可选校验
+    if DATASET_MD5:
+        md5_now = _md5(archive_path)
+        if md5_now.lower() != DATASET_MD5.lower():
+            raise ValueError(f"MD5 不一致：{md5_now} != {DATASET_MD5}  ({archive_path})")
+        else:
+            print(f"[DATA] MD5 OK: {md5_now}")
+
+    # 解压
+    print(f"[DATA] Extracting to: {DATASET_DIR}")
+    _extract_archive(archive_path, DATASET_DIR)
+
+    # 再次定位
+    base = _auto_locate_fitbit_base(DATASET_DIR)
+    print(f"[DATA] Ready. Fitbit base: {base}")
+    return base
 
 # ----------------------------
 # Logging
@@ -24,10 +145,12 @@ logger = logging.getLogger(__name__)
 # 数据根目录（可用环境变量覆盖）
 # 例如：/home/shi/d_folder/.../Fitabase Data 4.12.16-5.12.16
 # ----------------------------
-FITBIT_BASE_DIR = os.environ.get(
+FITBIT_BASE_DIR = None
+
+'''FITBIT_BASE_DIR = os.environ.get(
     "FITBIT_BASE_DIR",
     "/home/shi/d_folder/fedops/MNIST/dataset/archive/mturkfitbit_export_4.12.16-5.12.16/Fitabase Data 4.12.16-5.12.16"
-)
+)'''
 
 FEATURES = ["Steps", "Calories", "AvgHeartRate", "StressLevel"]
 LABEL = "SleepQuality"
@@ -52,6 +175,9 @@ def _load_fitbit_raw() -> pd.DataFrame:
     读取 Fitabase CSV，按 (UserId, Hour) 对齐步数/卡路里/心率，并与日级睡眠标签合并。
     产出列：['UserId','Hour','Steps','Calories','AvgHeartRate','StressLevel','SleepQuality']（按时间排序）
     """
+    global FITBIT_BASE_DIR
+    if FITBIT_BASE_DIR is None:
+        FITBIT_BASE_DIR = _ensure_fitbit_data().as_posix()
     # 1) 睡眠（日级标签）
     sleep_fp = os.path.join(FITBIT_BASE_DIR, "sleepDay_merged.csv")
     sleep_df = pd.read_csv(sleep_fp, parse_dates=["SleepDay"])
@@ -283,3 +409,4 @@ def load_partition(dataset: str,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
+
