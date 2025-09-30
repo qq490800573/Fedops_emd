@@ -45,9 +45,9 @@ def main(cfg: DictConfig) -> None:
     model_name = type(model).__name__
 
     # 2) （可选）构建 Fitbit 数据的 DataLoader；若跳过则给空 Loader
-    if skip_data:
-        gl_val_loader = _make_empty_loader()
-    else:
+
+    gl_val_loader = _make_empty_loader()
+    '''else:
         seq_len = getattr(cfg.dataset, "seq_len", 6)
         # restrict_hours = getattr(cfg.dataset, "restrict_hours", None)
         _, _, gl_val_loader = data_preparation.load_partition(
@@ -59,7 +59,7 @@ def main(cfg: DictConfig) -> None:
         )
 
     # 3) 评测函数：若跳过评测则使用哑评测
-    gl_test_torch = _dummy_test_fn() if skip_eval else models.test_torch()
+    gl_test_torch = _dummy_test_fn() if skip_eval else models.test_torch()'''
 
     # 4) 启动联邦服务端
     fl_server = FLServer(
