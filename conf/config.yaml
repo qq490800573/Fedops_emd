@@ -18,7 +18,7 @@ dataset:
 
 
 # client
-task_id: 'EMD_sleep' # Input your Task Name that you register in FedOps Website
+task_id: 'emdsleep' # Input your Task Name that you register in FedOps Website
 
 wandb: 
   use: false # Whether to use wandb
