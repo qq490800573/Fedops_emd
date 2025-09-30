@@ -20,9 +20,12 @@ def _make_empty_loader():
     return DataLoader(_EmptyDataset(), batch_size=1, shuffle=False)
 
 def _dummy_test_fn():
-    """与 models.test_torch() 同型的占位评测函数，直接返回 0。"""
+    """与 models.test_torch() 同型的占位评测函数。"""
     def _inner(model, loader, device):
-        return {"loss": 0.0, "acc": 0.0}
+        loss = 0.0
+        num_examples = int(getattr(getattr(loader, "dataset", []), "__len__", lambda: 0)())
+        metrics = {"acc": 0.0}
+        return loss, num_examples, metrics
     return _inner
 
 
