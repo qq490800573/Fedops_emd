@@ -1,4 +1,6 @@
 # data_preparation.py
+# -*- coding: utf-8 -*-
+
 import os
 import json
 import logging
@@ -45,6 +47,18 @@ LABEL = "SleepQuality"
 
 # 为了与原项目的调用保持一致：运行期确定的 CSV 根目录
 FITBIT_BASE_DIR = None  # 运行时由 _ensure_archive_ready() 决定
+
+# === NEW: KaggleHub 下载开关与数据集配置 ===
+try:
+    import kagglehub  # pip install kagglehub
+    _HAS_KAGGLEHUB = True
+except Exception:
+    _HAS_KAGGLEHUB = False
+
+USE_KAGGLE = os.environ.get("USE_KAGGLE", "1")           # "1"=优先用 kagglehub, "0"=禁用
+KAGGLE_DATASET = os.environ.get("KAGGLE_DATASET", "arashnic/fitbit")
+# 默认把 kagglehub 下载的目录映射/复制到 DATASET_DIR/ARCHIVE_TOP（或你指定的别名）
+KAGGLE_TARGET_TOP = os.environ.get("KAGGLE_TARGET_TOP", ARCHIVE_TOP)
 
 
 # ============================ 工具函数：下载 & 解压 ============================
@@ -123,56 +137,95 @@ def _auto_locate_fitbit_base(root: Path) -> Path:
     return csv_base.resolve()
 
 
+# === NEW: KaggleHub 下载器 ===
+def _prepare_from_kagglehub(dataset_slug: str, target_top: str) -> Path:
+    """
+    使用 kagglehub 下载数据集（通常已解压为目录），并确保
+    DATASET_DIR/target_top 存在（软链接或拷贝），返回 CSV 根定位目录。
+    """
+    if not _HAS_KAGGLEHUB:
+        raise RuntimeError("kagglehub 未安装：pip install kagglehub 或设置 USE_KAGGLE=0")
+
+    logger.info(f"[DATA] KaggleHub downloading: {dataset_slug}")
+    # kagglehub 会把数据集下载到本机缓存目录，返回该路径
+    src_path = Path(kagglehub.dataset_download(dataset_slug)).resolve()
+    logger.info(f"[DATA] KaggleHub path: {src_path}")
+
+    # 将下载目录“挂载”为 DATASET_DIR/target_top（与 URL 解压后的结构保持一致）
+    top = DATASET_DIR / target_top
+    DATASET_DIR.mkdir(parents=True, exist_ok=True)
+
+    if top.exists():
+        logger.info(f"[DATA] Reusing existing directory: {top}")
+    else:
+        try:
+            if top.is_symlink() or top.exists():
+                top.unlink()
+            top.symlink_to(src_path, target_is_directory=True)
+            logger.info(f"[DATA] Linked {src_path} -> {top}")
+        except Exception as e:
+            logger.warning(f"[DATA] symlink 失败，改为复制目录：{e}")
+            shutil.copytree(src_path, top)
+            logger.info(f"[DATA] Copied {src_path} -> {top}")
+
+    # kaggle 数据集里通常已经是“解压后的目录结构”，直接走自动定位
+    csv_base = _auto_locate_fitbit_base(DATASET_DIR)
+    logger.info(f"[DATA] Kaggle ready. CSV base: {csv_base}")
+    return csv_base
+
+
 def _ensure_archive_ready() -> Path:
     """
     确保 DATASET_DIR 下存在解压后的 ARCHIVE_TOP 目录。
     - 若已存在则直接用；
-    - 否则下载 ARCHIVE_URL → DATASET_DIR/archive_downloads/ARCHIVE_NAME 并解压到 DATASET_DIR；
+    - 否则优先尝试 KaggleHub（当 USE_KAGGLE=1 且安装了 kagglehub）；
+    - 若未启用或失败，再使用 ARCHIVE_URL 方式下载解压；
     - 返回 CSV 根目录（包含 *_merged.csv 的目录）。
     """
     DATASET_DIR.mkdir(parents=True, exist_ok=True)
     top = DATASET_DIR / ARCHIVE_TOP
 
+    # 已存在 → 直接用
+    if top.exists():
+        csv_base = _auto_locate_fitbit_base(DATASET_DIR)
+        print(f"[DATA] Ready. CSV base: {csv_base}")
+        return csv_base
+
+    # 尝试 KaggleHub
+    if USE_KAGGLE == "1":
+        try:
+            return _prepare_from_kagglehub(KAGGLE_DATASET, KAGGLE_TARGET_TOP)
+        except Exception as e:
+            logger.warning(f"[DATA] KaggleHub 路径准备失败，回退到 URL 下载：{e}")
+
+    # 回退：URL 下载 + 解压
+    if not ARCHIVE_URL:
+        raise FileNotFoundError(
+            f"数据未就绪：{top} 不存在，且未设置 ARCHIVE_URL/DATASET_URL（或 Kaggle 下载失败）。"
+        )
+    downloads = DATASET_DIR / "archive_downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    zip_path = downloads / ARCHIVE_NAME
+
+    if not zip_path.exists():
+        print(f"[DATA] Downloading archive from: {ARCHIVE_URL}")
+        _download_with_progress(ARCHIVE_URL, zip_path)
+    else:
+        print(f"[DATA] Using cached archive: {zip_path}")
+
+    if ARCHIVE_MD5:
+        m = _md5(zip_path)
+        if m.lower() != ARCHIVE_MD5.lower():
+            raise ValueError(f"MD5 不一致：{m} != {ARCHIVE_MD5}  ({zip_path})")
+        print(f"[DATA] MD5 OK: {m}")
+
+    print(f"[DATA] Extracting to: {DATASET_DIR}")
+    _extract_archive(zip_path, DATASET_DIR)
+
     if not top.exists():
-        if not ARCHIVE_URL:
-            raise FileNotFoundError(
-                f"数据未就绪：{top} 不存在，且未设置 ARCHIVE_URL/DATASET_URL 提供压缩包下载地址。"
-            )
-        downloads = DATASET_DIR / "archive_downloads"
-        downloads.mkdir(parents=True, exist_ok=True)
-        zip_path = downloads / ARCHIVE_NAME
-
-        if not zip_path.exists():
-            print(f"[DATA] Downloading archive from: {ARCHIVE_URL}")
-            _download_with_progress(ARCHIVE_URL, zip_path)
-        else:
-            print(f"[DATA] Using cached archive: {zip_path}")
-
-        if ARCHIVE_MD5:
-            m = _md5(zip_path)
-            if m.lower() != ARCHIVE_MD5.lower():
-                raise ValueError(f"MD5 不一致：{m} != {ARCHIVE_MD5}  ({zip_path})")
-            print(f"[DATA] MD5 OK: {m}")
-
-        print(f"[DATA] Extracting to: {DATASET_DIR}")
-        _extract_archive(zip_path, DATASET_DIR)
-
-        if not top.exists():
-            raise FileNotFoundError(f"解压后仍未发现 {top}，请检查压缩包内部结构。")
+        raise FileNotFoundError(f"解压后仍未发现 {top}，请检查压缩包内部结构。")
 
     csv_base = _auto_locate_fitbit_base(DATASET_DIR)
-
-    # 简单检查关键 CSV
-    must_csv = [
-        "sleepDay_merged.csv",
-        "hourlySteps_merged.csv",
-        "hourlyCalories_merged.csv",
-        "heartrate_seconds_merged.csv",
-    ]
-    missing = [f for f in must_csv if not (csv_base / f).exists()]
-    if missing:
-        print(f"[WARN] 缺少文件：{missing}（若文件名/结构不同，可通过通配或在读取处调整）")
-
     print(f"[DATA] Ready. CSV base: {csv_base}")
     return csv_base
 
@@ -201,8 +254,8 @@ def _load_fitbit_raw() -> pd.DataFrame:
     # 1) 睡眠（日级标签）
     sleep_fp = os.path.join(FITBIT_BASE_DIR, "sleepDay_merged.csv")
     sleep_df = pd.read_csv(sleep_fp, parse_dates=["SleepDay"])
-    # 7 小时=420 分钟及以上记为高质量睡眠(1)
-    sleep_df["SleepQuality"] = (sleep_df["TotalMinutesAsleep"] >= 420).astype(int)
+    # 默认：6 小时=360 分钟及以上记为高质量睡眠(1)
+    sleep_df["SleepQuality"] = (sleep_df["TotalMinutesAsleep"] >= 360).astype(int)
     sleep_df["SleepDate"] = pd.to_datetime(sleep_df["SleepDay"].dt.date)
 
     # 2) 步数/卡路里（小时级）
@@ -210,7 +263,7 @@ def _load_fitbit_raw() -> pd.DataFrame:
     cals_fp = os.path.join(FITBIT_BASE_DIR, "hourlyCalories_merged.csv")
     steps_df = pd.read_csv(steps_fp, parse_dates=["ActivityHour"])
     cals_df = pd.read_csv(cals_fp, parse_dates=["ActivityHour"])
-    # 注意不同数据集版本中列名可能为 "StepTotal" 或 "Steps"；做个兜底
+    # 兼容不同数据集版本的步数字段名
     if "StepTotal" in steps_df.columns and "Steps" not in steps_df.columns:
         steps_df = steps_df.rename(columns={"StepTotal": "Steps"})
     activity_df = pd.merge(steps_df, cals_df, on=["Id", "ActivityHour"], how="inner")
@@ -283,7 +336,7 @@ def create_sequences_by_user(
             continue
         for i in range(len(f) - seq_length):
             X.append(f[i : i + seq_length])  # [T, F]
-            y.append(l[i + seq_length])  # 下一时刻标签
+            y.append(l[i + seq_length])      # 下一时刻标签
             groups.append(uid)
 
     if len(X) == 0:
@@ -414,7 +467,7 @@ def load_partition(
 ):
     """
     统一入口（兼容你现有调用签名）：
-      - 从 archive.zip（HTTP）或已存在目录准备数据；
+      - 从 KaggleHub（优先）或 archive.zip（HTTP）/已存在目录准备数据；
       - 读取 Fitabase CSV，做 T=seq_length 窗口化，按用户分组切分 train/val/test；
       - 返回 (train_loader, val_loader, test_loader)。
     """
@@ -444,4 +497,3 @@ def load_partition(
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
-
