@@ -2,3 +2,4 @@
 fedops
 torchvision
 scikit-learn
+kagglehub
